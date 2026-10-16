@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { URL } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type DiffLineKind = "context" | "add" | "delete" | "meta";
 type DiffFileStatus = "modified" | "added" | "deleted" | "renamed" | "binary" | "unknown";
@@ -44,6 +44,14 @@ type DiffModeOption = {
 	available: boolean;
 };
 
+type BranchBaseSource = "pr" | "main" | "offline";
+
+export type BranchBase = {
+	baseRef: string;
+	mergeBase: string;
+	source: BranchBaseSource;
+};
+
 type DiffCapture = {
 	gitRoot: string;
 	branchName: string;
@@ -52,7 +60,7 @@ type DiffCapture = {
 	truncated: boolean;
 	modeLabel: string;
 	modeDescription: string;
-	baseRef?: string;
+	branchBase?: BranchBase;
 	additions: number;
 	deletions: number;
 };
@@ -108,7 +116,7 @@ type Review = {
 	mode: DiffMode;
 	modeLabel: string;
 	modeDescription: string;
-	baseRef?: string;
+	branchBase: BranchBase;
 	additions: number;
 	deletions: number;
 	diffText: string;
@@ -282,16 +290,16 @@ function parseUnifiedDiff(diffText: string): DiffFile[] {
 	return files;
 }
 
-async function getGitRoot(pi: ExtensionAPI, cwd: string): Promise<string> {
-	const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: 5000 });
+async function getGitRoot(pi: ExtensionAPI, cwd: string, signal?: AbortSignal): Promise<string> {
+	const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: 5000, signal });
 	if (result.code !== 0) throw new Error("Not inside a git repository");
 	return result.stdout.trim() || cwd;
 }
 
-async function getBranchName(pi: ExtensionAPI, gitRoot: string): Promise<string> {
-	const symbolic = await pi.exec("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { cwd: gitRoot, timeout: 5000 });
+async function getBranchName(pi: ExtensionAPI, gitRoot: string, signal?: AbortSignal): Promise<string> {
+	const symbolic = await pi.exec("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { cwd: gitRoot, timeout: 5000, signal });
 	if (symbolic.code === 0 && symbolic.stdout.trim()) return symbolic.stdout.trim();
-	const detached = await pi.exec("git", ["rev-parse", "--short", "HEAD"], { cwd: gitRoot, timeout: 5000 });
+	const detached = await pi.exec("git", ["rev-parse", "--short", "HEAD"], { cwd: gitRoot, timeout: 5000, signal });
 	return detached.code === 0 && detached.stdout.trim() ? `detached@${detached.stdout.trim()}` : "worktree";
 }
 
@@ -367,28 +375,192 @@ async function captureWorktreeTree(gitRoot: string): Promise<string> {
 	}
 }
 
-async function resolveMainBase(pi: ExtensionAPI, gitRoot: string): Promise<{ baseRef: string; mergeBase: string }> {
-	const candidates = ["main", "origin/main", "upstream/main"];
-	for (const remote of ["origin", "upstream"]) {
-		const symbolic = await pi.exec("git", ["symbolic-ref", "--quiet", "--short", `refs/remotes/${remote}/HEAD`], { cwd: gitRoot, timeout: 5000 });
-		const defaultRef = symbolic.stdout.trim();
-		if (symbolic.code === 0 && defaultRef && !candidates.includes(defaultRef)) candidates.push(defaultRef);
-	}
-	candidates.push("master", "origin/master", "upstream/master");
-	for (const baseRef of candidates) {
-		const exists = await pi.exec("git", ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], { cwd: gitRoot, timeout: 5000 });
-		if (exists.code !== 0) continue;
-		const mergeBase = await pi.exec("git", ["merge-base", "HEAD", baseRef], { cwd: gitRoot, timeout: 5000 });
-		if (mergeBase.code === 0 && mergeBase.stdout.trim()) return { baseRef, mergeBase: mergeBase.stdout.trim() };
-	}
-	throw new Error("Could not find main (or a main/master remote) to compare this branch against");
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw new Error("Review cancelled");
 }
 
-async function diffTrees(pi: ExtensionAPI, gitRoot: string, before: string, after: string): Promise<string> {
+async function commitOid(pi: ExtensionAPI, gitRoot: string, ref: string, signal?: AbortSignal): Promise<string | undefined> {
+	const result = await pi.exec("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+		cwd: gitRoot,
+		timeout: 5000,
+		signal,
+	});
+	throwIfAborted(signal);
+	return result.code === 0 && result.stdout.trim() ? result.stdout.trim() : undefined;
+}
+
+function branchBaseSourceLabel(source: BranchBaseSource): string {
+	return source === "pr" ? "PR base" : source === "main" ? "main fallback" : "offline fallback";
+}
+
+async function branchBaseForTip(
+	pi: ExtensionAPI,
+	gitRoot: string,
+	baseRef: string,
+	baseTip: string,
+	source: BranchBaseSource,
+	signal?: AbortSignal,
+): Promise<BranchBase | undefined> {
+	const result = await pi.exec("git", ["merge-base", "HEAD", baseTip], { cwd: gitRoot, timeout: 5000, signal });
+	throwIfAborted(signal);
+	if (result.code !== 0 || !result.stdout.trim()) return undefined;
+	return { baseRef, mergeBase: result.stdout.trim(), source };
+}
+
+async function listRemotes(pi: ExtensionAPI, gitRoot: string, signal?: AbortSignal): Promise<string[]> {
+	const result = await pi.exec("git", ["remote"], { cwd: gitRoot, timeout: 5000, signal });
+	throwIfAborted(signal);
+	if (result.code !== 0) return [];
+	const remotes = result.stdout.split("\n").map((remote) => remote.trim()).filter(Boolean);
+	return [...remotes.filter((remote) => remote === "origin"), ...remotes.filter((remote) => remote !== "origin")];
+}
+
+function repositorySlugFromRemoteUrl(remoteUrl: string): string | undefined {
+	const scp = remoteUrl.match(/^[^@]+@[^:]+:(.+)$/);
+	let path = scp?.[1];
+	if (!path) {
+		try {
+			path = new URL(remoteUrl).pathname;
+		} catch {
+			return undefined;
+		}
+	}
+	const parts = path.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "").split("/");
+	return parts.length >= 2 ? parts.slice(-2).join("/").toLowerCase() : undefined;
+}
+
+async function pullRequestBase(
+	pi: ExtensionAPI,
+	gitRoot: string,
+	branchName: string,
+	signal?: AbortSignal,
+): Promise<BranchBase | undefined> {
+	if (branchName.startsWith("detached@") || branchName === "worktree") return undefined;
+	const pr = await pi.exec(
+		"gh",
+		["pr", "view", "--json", "headRefName,baseRefName,baseRefOid"],
+		{ cwd: gitRoot, timeout: 10000, signal },
+	);
+	throwIfAborted(signal);
+	if (pr.code !== 0 || !pr.stdout.trim()) return undefined;
+
+	let metadata: { headRefName?: string; baseRefName?: string; baseRefOid?: string };
+	try {
+		metadata = JSON.parse(pr.stdout) as typeof metadata;
+	} catch {
+		return undefined;
+	}
+	if (metadata.headRefName !== branchName || !metadata.baseRefName || !metadata.baseRefOid) return undefined;
+
+	let baseTip = await commitOid(pi, gitRoot, metadata.baseRefOid, signal);
+	if (baseTip) {
+		const resolved = await branchBaseForTip(pi, gitRoot, metadata.baseRefName, baseTip, "pr", signal);
+		if (resolved) return resolved;
+		throw new Error(`PR base ${metadata.baseRefName} has no common ancestor with HEAD`);
+	}
+
+	const remotes = await listRemotes(pi, gitRoot, signal);
+	if (!baseTip) {
+		const repository = await pi.exec("gh", ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"], {
+			cwd: gitRoot,
+			timeout: 10000,
+			signal,
+		});
+		throwIfAborted(signal);
+		const repositorySlug = repository.code === 0 ? repository.stdout.trim().toLowerCase() : "";
+		for (const remote of remotes) {
+			const url = await pi.exec("git", ["remote", "get-url", remote], { cwd: gitRoot, timeout: 5000, signal });
+			throwIfAborted(signal);
+			if (url.code !== 0 || repositorySlugFromRemoteUrl(url.stdout.trim()) !== repositorySlug) continue;
+			await pi.exec("git", ["fetch", "--quiet", "--no-tags", remote, `refs/heads/${metadata.baseRefName}`], {
+				cwd: gitRoot,
+				timeout: 15000,
+				signal,
+			});
+			throwIfAborted(signal);
+			baseTip = await commitOid(pi, gitRoot, metadata.baseRefOid, signal);
+			if (baseTip) break;
+		}
+	}
+	if (baseTip) {
+		const resolved = await branchBaseForTip(pi, gitRoot, metadata.baseRefName, baseTip, "pr", signal);
+		if (resolved) return resolved;
+		throw new Error(`PR base ${metadata.baseRefName} has no common ancestor with HEAD`);
+	}
+
+	for (const ref of [...remotes.map((remote) => `${remote}/${metadata.baseRefName}`), metadata.baseRefName]) {
+		const oid = await commitOid(pi, gitRoot, ref, signal);
+		if (!oid) continue;
+		const resolved = await branchBaseForTip(pi, gitRoot, metadata.baseRefName, oid, "offline", signal);
+		if (resolved) return resolved;
+	}
+	return undefined;
+}
+
+export async function resolveBranchBase(
+	pi: ExtensionAPI,
+	gitRoot: string,
+	branchName: string,
+	signal?: AbortSignal,
+): Promise<BranchBase> {
+	const prBase = await pullRequestBase(pi, gitRoot, branchName, signal);
+	if (prBase) return prBase;
+
+	const remotes = await listRemotes(pi, gitRoot, signal);
+	const remoteBranches = new Map<string, string>();
+	for (const remote of remotes) {
+		const symbolic = await pi.exec("git", ["symbolic-ref", "--quiet", "--short", `refs/remotes/${remote}/HEAD`], {
+			cwd: gitRoot,
+			timeout: 5000,
+			signal,
+		});
+		throwIfAborted(signal);
+		const defaultRef = symbolic.code === 0 ? symbolic.stdout.trim() : "";
+		remoteBranches.set(remote, defaultRef.endsWith("/master") ? "master" : "main");
+	}
+
+	for (const [remote, branch] of remoteBranches) {
+		const remoteRef = `${remote}/${branch}`;
+		const fetched = await pi.exec(
+			"git",
+			["fetch", "--quiet", "--no-tags", remote, `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`],
+			{ cwd: gitRoot, timeout: 15000, signal },
+		);
+		throwIfAborted(signal);
+		if (fetched.code !== 0) continue;
+		const oid = await commitOid(pi, gitRoot, remoteRef, signal);
+		if (!oid) continue;
+		const resolved = await branchBaseForTip(pi, gitRoot, remoteRef, oid, "main", signal);
+		if (resolved) return resolved;
+	}
+
+	const offlineCandidates = [
+		...remotes.map((remote) => `${remote}/${remoteBranches.get(remote) ?? "main"}`),
+		...remotes.map((remote) => `${remote}/main`),
+		"main",
+		...remotes.filter((remote) => remoteBranches.get(remote) === "master").map((remote) => `${remote}/master`),
+		...(remotes.length === 0 || [...remoteBranches.values()].includes("master") ? ["master"] : []),
+	];
+	for (const ref of [...new Set(offlineCandidates)]) {
+		const oid = await commitOid(pi, gitRoot, ref, signal);
+		if (!oid) continue;
+		const resolved = await branchBaseForTip(pi, gitRoot, ref, oid, "offline", signal);
+		if (resolved) return resolved;
+	}
+	throw new Error("Could not find the PR base or main (including offline main/master refs) to compare this branch against");
+}
+
+async function diffTrees(
+	pi: ExtensionAPI,
+	gitRoot: string,
+	before: string,
+	after: string,
+	signal?: AbortSignal,
+): Promise<string> {
 	const result = await pi.exec(
 		"git",
 		["-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-color", "--find-renames", "--submodule=short", before, after],
-		{ cwd: gitRoot, timeout: 30000 },
+		{ cwd: gitRoot, timeout: 30000, signal },
 	);
 	if (result.code !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || "git diff failed");
 	return result.stdout;
@@ -478,11 +650,16 @@ function scheduleTurnActivityRefresh(pi: ExtensionAPI, gitRoot: string): void {
 	activityRefreshTimers.set(gitRoot, timer);
 }
 
-function diffModeOptions(gitRoot: string, baseRef?: string): DiffModeOption[] {
+function diffModeOptions(gitRoot: string, branchBase: BranchBase): DiffModeOption[] {
 	const activity = turnActivities.get(gitRoot);
 	return [
 		...(activity?.running ? [{ id: "active-turn" as const, label: "Active turn", description: "Changes in the current Pi turn", available: true }] : []),
-		{ id: "branch", label: "Branch", description: `Everything changed since ${baseRef ?? "main"}`, available: true },
+		{
+			id: "branch",
+			label: "Branch",
+			description: `Everything changed since ${branchBase.baseRef} · ${branchBaseSourceLabel(branchBase.source)}`,
+			available: true,
+		},
 		{ id: "uncommitted", label: "Uncommitted", description: "Working tree compared with HEAD", available: true },
 		{
 			id: "last-turn",
@@ -493,12 +670,18 @@ function diffModeOptions(gitRoot: string, baseRef?: string): DiffModeOption[] {
 	];
 }
 
-async function captureDiff(pi: ExtensionAPI, cwd: string, mode: DiffMode): Promise<DiffCapture> {
-	const gitRoot = await getGitRoot(pi, cwd);
-	const branchName = await getBranchName(pi, gitRoot);
+async function captureDiff(
+	pi: ExtensionAPI,
+	cwd: string,
+	mode: DiffMode,
+	branchBase?: BranchBase,
+	signal?: AbortSignal,
+): Promise<DiffCapture> {
+	const gitRoot = await getGitRoot(pi, cwd, signal);
+	const branchName = await getBranchName(pi, gitRoot, signal);
 	let before: string;
 	let after: string;
-	let baseRef: string | undefined;
+	let resolvedBranchBase: BranchBase | undefined;
 	let modeLabel: string;
 	let modeDescription: string;
 
@@ -517,13 +700,14 @@ async function captureDiff(pi: ExtensionAPI, cwd: string, mode: DiffMode): Promi
 		modeLabel = "Last turn";
 		modeDescription = "Changes made by the latest Pi turn";
 	} else {
+		throwIfAborted(signal);
 		after = await captureWorktreeTree(gitRoot);
+		throwIfAborted(signal);
 		if (mode === "branch") {
-			const base = await resolveMainBase(pi, gitRoot);
-			before = base.mergeBase;
-			baseRef = base.baseRef;
+			resolvedBranchBase = branchBase ?? (await resolveBranchBase(pi, gitRoot, branchName, signal));
+			before = resolvedBranchBase.mergeBase;
 			modeLabel = "Branch";
-			modeDescription = `Compared with ${baseRef}`;
+			modeDescription = `Compared with ${resolvedBranchBase.baseRef} · ${branchBaseSourceLabel(resolvedBranchBase.source)}`;
 		} else {
 			const head = await pi.exec("git", ["rev-parse", "HEAD^{tree}"], { cwd: gitRoot, timeout: 5000 });
 			if (head.code !== 0) throw new Error(head.stderr.trim() || "Could not resolve HEAD");
@@ -533,14 +717,14 @@ async function captureDiff(pi: ExtensionAPI, cwd: string, mode: DiffMode): Promi
 		}
 	}
 
-	let diffText = await diffTrees(pi, gitRoot, before, after);
+	let diffText = await diffTrees(pi, gitRoot, before, after, signal);
 	let truncated = false;
 	if (Buffer.byteLength(diffText, "utf8") > MAX_DIFF_BYTES) {
 		truncated = true;
 		diffText = diffText.slice(0, MAX_DIFF_BYTES) + "\n\n[review-diff: diff truncated]\n";
 	}
 	const files = parseUnifiedDiff(diffText);
-	return { gitRoot, branchName, diffText, files, truncated, modeLabel, modeDescription, baseRef, ...diffStats(files) };
+	return { gitRoot, branchName, diffText, files, truncated, modeLabel, modeDescription, branchBase: resolvedBranchBase, ...diffStats(files) };
 }
 
 function formatRange(start: number | undefined, end: number | undefined): string | undefined {
@@ -626,7 +810,7 @@ function applyCapture(review: Review, capture: DiffCapture): void {
 	review.files = capture.files;
 	review.modeLabel = capture.modeLabel;
 	review.modeDescription = capture.modeDescription;
-	if (capture.baseRef) review.baseRef = capture.baseRef;
+	if (capture.branchBase) review.branchBase = capture.branchBase;
 	review.additions = capture.additions;
 	review.deletions = capture.deletions;
 	review.updatedAt = Date.now();
@@ -645,17 +829,18 @@ function reviewResponse(review: Review): Record<string, unknown> {
 		mode: review.mode,
 		modeLabel: review.modeLabel,
 		modeDescription: review.modeDescription,
-		baseRef: review.baseRef,
+		baseRef: review.branchBase.baseRef,
+		baseSourceLabel: branchBaseSourceLabel(review.branchBase.source),
 		additions: review.additions,
 		deletions: review.deletions,
-		modes: diffModeOptions(review.gitRoot, review.baseRef),
+		modes: diffModeOptions(review.gitRoot, review.branchBase),
 		files: review.files,
 		comments: review.comments,
 	};
 }
 
 async function refreshReview(pi: ExtensionAPI, review: Review): Promise<void> {
-	applyCapture(review, await captureDiff(pi, review.cwd, review.mode));
+	applyCapture(review, await captureDiff(pi, review.cwd, review.mode, review.branchBase));
 }
 
 async function refreshAllReviews(pi: ExtensionAPI): Promise<void> {
@@ -734,7 +919,7 @@ function createRequestHandler(pi: ExtensionAPI): http.RequestListener {
 					jsonResponse(res, 409, { error: "Last turn is not available yet. Complete a Pi turn, then try again." });
 					return;
 				}
-				const capture = await captureDiff(pi, review.cwd, mode);
+				const capture = await captureDiff(pi, review.cwd, mode, review.branchBase);
 				review.mode = mode;
 				applyCapture(review, capture);
 				jsonResponse(res, 200, reviewResponse(review));
@@ -832,10 +1017,15 @@ async function openUrl(pi: ExtensionAPI, url: string): Promise<void> {
 	await pi.exec("xdg-open", [url], { timeout: 5000 });
 }
 
-async function createReview(pi: ExtensionAPI, ctx: ExtensionContext): Promise<{ review: Review; url: string; truncated: boolean }> {
+async function createReview(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	signal?: AbortSignal,
+): Promise<{ review: Review; url: string; truncated: boolean }> {
 	const server = await ensureServer(pi);
 	const mode: DiffMode = "branch";
-	const capture = await captureDiff(pi, ctx.cwd, mode);
+	const capture = await captureDiff(pi, ctx.cwd, mode, undefined, signal);
+	if (!capture.branchBase) throw new Error("Could not resolve the branch base");
 	const review: Review = {
 		id: randomId("rvw"),
 		createdAt: Date.now(),
@@ -847,7 +1037,7 @@ async function createReview(pi: ExtensionAPI, ctx: ExtensionContext): Promise<{ 
 		mode,
 		modeLabel: capture.modeLabel,
 		modeDescription: capture.modeDescription,
-		baseRef: capture.baseRef,
+		branchBase: capture.branchBase,
 		additions: capture.additions,
 		deletions: capture.deletions,
 		diffText: capture.diffText,
@@ -1851,7 +2041,9 @@ function render() {
   renderSidebar();
   document.getElementById('additions').textContent = '+' + (review.additions || 0);
   document.getElementById('deletions').textContent = '−' + (review.deletions || 0);
-  const comparisonTarget = review.mode === 'branch' ? (review.baseRef || 'main') : review.mode === 'uncommitted' ? 'HEAD' : 'turn start';
+  const comparisonTarget = review.mode === 'branch'
+    ? (review.baseRef || 'main') + (review.baseSourceLabel ? ' · ' + review.baseSourceLabel : '')
+    : review.mode === 'uncommitted' ? 'HEAD' : 'turn start';
   const comparison = document.getElementById('branch-comparison');
   comparison.innerHTML = '<span class="branch-current">' + escapeHtml(review.branchName || 'worktree') + '</span><span class="comparison-arrow">→</span><span class="comparison-target">' + escapeHtml(comparisonTarget) + '</span>';
   comparison.title = (review.branchName || 'worktree') + ' compared with ' + comparisonTarget;
@@ -2326,7 +2518,40 @@ export default function reviewDiffExtension(pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			lastCtx = ctx;
 			try {
-				const { review, url, truncated } = await createReview(pi, ctx);
+				let created: Awaited<ReturnType<typeof createReview>> | undefined;
+				if (ctx.mode === "tui") {
+					type LoaderResult =
+						| { ok: true; value: Awaited<ReturnType<typeof createReview>> }
+						| { ok: false; error: string };
+					const loaded = await ctx.ui.custom<LoaderResult | null>((tui, theme, _keybindings, done) => {
+						const loader = new BorderedLoader(tui, theme, "Finding where this branch came from…");
+						let settled = false;
+						const finish = (value: LoaderResult | null) => {
+							if (settled) return;
+							settled = true;
+							done(value);
+						};
+						loader.onAbort = () => finish(null);
+						createReview(pi, ctx, loader.signal)
+							.then((value) => finish({ ok: true, value }))
+							.catch((error) => {
+								if (loader.signal.aborted) finish(null);
+								else finish({ ok: false, error: error instanceof Error ? error.message : String(error) });
+							});
+						return loader;
+					});
+					if (!loaded) {
+						ctx.ui.notify("Diff review cancelled", "info");
+						return;
+					}
+					if (!loaded.ok) throw new Error(loaded.error);
+					created = loaded.value;
+				} else {
+					created = await createReview(pi, ctx);
+				}
+				if (!created) throw new Error("Could not create diff review");
+
+				const { review, url, truncated } = created;
 				updateWidget(ctx);
 				await openUrl(pi, url);
 				ctx.ui.notify(`Opened diff review ${review.id}${truncated ? " (diff truncated)" : ""}`, truncated ? "warning" : "info");

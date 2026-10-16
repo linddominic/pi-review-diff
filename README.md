@@ -2,7 +2,7 @@
 
 Review your local changes in a web UI and send review feedback back into Pi.
 
-- review the entire branch against `main`, including committed and local changes
+- review the entire branch against its GitHub PR base, falling back to refreshed `main`, including committed and local changes
 - switch between **Branch**, **Uncommitted**, live **Active turn**, and **Last turn** views
 - syntax highlighting for Swift, Kotlin, TypeScript/JavaScript, HTML, and CSS
 - stream live per-turn file and line counts while Pi is working
@@ -33,7 +33,9 @@ In Pi, run:
 /review-diff
 ```
 
-The review opens on **Branch**, comparing the current worktree with the merge base of `main`. Use the change selector to switch to:
+The review opens on **Branch**. It uses the GitHub PR's configured base when one exists, including non-main bases in stacked PRs. Without a PR, it refreshes and uses `main`; offline, it falls back to existing remote or local main/master refs. The comparison source is shown beside the branch name.
+
+Pi displays a cancellable “Finding where this branch came from…” loader while resolving the base. Use the change selector to switch to:
 
 - **Uncommitted** — the current worktree compared with `HEAD`
 - **Active turn** — a read-only live diff that appears while Pi is running and updates after file-changing tools complete
